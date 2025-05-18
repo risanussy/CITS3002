@@ -243,6 +243,32 @@ def parse_coordinate(coord_str):
 
     return (row, col)
 
+def safe_parse_coordinate(coord_str, board_size=BOARD_SIZE):
+    """
+    Versi aman parse_coordinate:
+      • Validasi A..J dan 1..10 (untuk board 10×10).
+      • Lempar ValueError bila tidak valid.
+    """
+    if not coord_str:
+        raise ValueError("empty input")
+    coord_str = coord_str.strip().upper()
+
+    if len(coord_str) < 2 or not coord_str[0].isalpha():
+        raise ValueError("must start with a letter")
+
+    row = ord(coord_str[0]) - ord('A')
+    if not (0 <= row < board_size):
+        raise ValueError("row out of range (A-J)")
+
+    try:
+        col = int(coord_str[1:]) - 1
+    except ValueError:
+        raise ValueError("column must be a number")
+
+    if not (0 <= col < board_size):
+        raise ValueError(f"column out of range (1-{board_size})")
+
+    return row, col
 
 def run_single_player_game_locally():
     """
@@ -291,7 +317,6 @@ def run_single_player_game_locally():
 
         except ValueError as e:
             print("  >> Invalid input:", e)
-
 
 def run_single_player_game_online(rfile, wfile):
     """

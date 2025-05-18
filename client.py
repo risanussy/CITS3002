@@ -1,78 +1,59 @@
-"""
-client.py
+import socket, threading, sys
+import protocol as proto
 
-Connects to a Battleship server which runs the single-player game.
-Simply pipes user input to the server, and prints all server responses.
+HOST, PORT = "127.0.0.1", 5000
+running = True
 
-TODO: Fix the message synchronization issue using concurrency (Tier 1, item 1).
-"""
+# ───────────────────────────────────────── receiver ──
+def recv_loop(sock):
+    global running                          # ⬅️ taruh di sini
+    while running:
+        pkt = proto.recv_pkt(sock)
+        if pkt is None:
+            break
+        if pkt.type == proto.TYPE_GAME:
+            print(pkt.data.decode())
+        elif pkt.type == proto.TYPE_CHAT:
+            print(f"[CHAT] {pkt.data.decode()}")
+        else:                               # TYPE_CTRL
+            print(f"[INFO] {pkt.data.decode()}")
+    print("## Disconnected")
+    running = False
 
-import socket
-import threading
-import sys
-
-HOST = "127.0.0.1"
-PORT = 5000
-running = True 
-
-
-def receiver(rfile):
-    """Continuously print everything that arrives from the server."""
-    global running
-    try:
-        while running:
-            line = rfile.readline()
-            if not line:
-                print("\n[INFO] Server closed the connection.")
-                running = False
-                break
-            line = line.rstrip("\n")
-            if line == "GRID":
-                print("\n[Board]")
-                while True:
-                    bl = rfile.readline()
-                    if not bl or bl.strip() == "":
-                        break
-                    print(bl.rstrip("\n"))
-            else:
-                print(line)
-    except Exception as e:
-        if running:
-            print(f"\n[ERROR] Receiver thread: {e}")
-    finally:
-        running = False
-
-
+# ───────────────────────────────────────── main ──
 def main():
     global running
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.connect((HOST, PORT))
-        rfile = s.makefile("r")
-        wfile = s.makefile("w", buffering=1)  
-        
-        threading.Thread(target=receiver, args=(rfile,), daemon=True).start()
+    username = input("Username: ").strip() or "anon"
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.connect((HOST, PORT))
+    sock.sendall((username + "\n").encode())       # baris pertama: username
 
+    threading.Thread(target=recv_loop, args=(sock,), daemon=True).start()
+    seqtx = proto.seq_gen()
+
+    try:
+        while running:
+            msg = input(">> ").strip()
+            if not running:
+                break
+            if msg.startswith("/chat "):
+                payload = msg[6:].encode()
+                pkt_type = proto.TYPE_CHAT
+            else:
+                payload = msg.encode()
+                pkt_type = proto.TYPE_GAME
+            proto.send_pkt(sock, proto.Packet(pkt_type, next(seqtx), payload))
+            if msg.lower() == "quit":
+                break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        running = False
         try:
-            while running:
-                try:
-                    user = input(">> ").strip()
-                except EOFError:
-                    user = "quit"
-                if not running:
-                    break  
-                wfile.write(user + "\n")
-                wfile.flush()   
-                if user.lower() == "quit":
-                    running = False
-        except KeyboardInterrupt:
-            print("\n[INFO] Closing client.")
-        finally:
-            running = False
-            try:
-                s.shutdown(socket.SHUT_RDWR)
-            except Exception:
-                pass
-
+            sock.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+        sock.close()
 
 if __name__ == "__main__":
     main()
