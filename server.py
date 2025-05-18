@@ -114,6 +114,33 @@ class GameSession(threading.Thread):
             if ptype == proto.TYPE_CHAT:
                 self.bcast(proto.TYPE_CHAT, f"{p.name}: {text}")
 
+    # ---------- tangani disconnect / reconnect ----------
+    def _handle_dc(self, leaver: Player, opponent: Player):
+        """
+        Dipanggil ketika 'leaver' terputus di tengah giliran.
+        • Broadcast info DC
+        • Tunggu sampai RECONN_WAIT detik — jika reattach() terjadi,
+          self.alive akan True kembali → game berlanjut.
+        • Jika gagal reconnect, lawan menang otomatis.
+        """
+        self.bcast(proto.TYPE_CTRL,
+                   f"DC {leaver.name} — waiting {RECONN_WAIT}s for reconnect…")
+
+        waited = 0
+        while waited < RECONN_WAIT and not leaver.alive:
+            time.sleep(1)
+            waited += 1
+
+        if leaver.alive:                         # sukses re-connect
+            self.bcast(proto.TYPE_CTRL,
+                       f"REJOIN {leaver.name} — game resumes.")
+        else:                                    # gagal → forfeit
+            opponent.send(proto.TYPE_CTRL, "WIN")
+            self.bcast(proto.TYPE_CTRL,
+                       f"{opponent.name} wins (opponent disconnect).")
+            # keluar dari main-loop dengan mem‐break pada caller
+
+
     # ---------- main loop ----------
     def run(self):
         p0, p1 = self.players
