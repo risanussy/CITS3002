@@ -59,14 +59,21 @@ class Player:
 
 
 
-    # reconnect: ganti socket
+    # reconnect: ganti socket    
     def reattach(self, new_sock):
         with self.lock:
-            try: self.sock.close()
-            except: pass
-            self.sock  = new_sock
+            try:
+                self.sock.shutdown(socket.SHUT_RDWR)
+                self.sock.close()
+            except:
+                pass
+            self.sock = new_sock
+            # reset seq & nonce streams OR biarkan melanjut?
+            # seq reset agar tidak ada overlap
             self.seqtx = proto.seq_gen()
+            self.noncetx = proto.nonce_gen()
             self.alive = True
+            self.send(proto.TYPE_CTRL, "RECONNECTED")
 
     def close(self):
         with self.lock:
@@ -124,9 +131,22 @@ class GameSession(threading.Thread):
             pl.send(ptype, msg)
 
     def push_boards(self):
+        """
+        Kirim ASCII board PLAYER-1 & PLAYER-2
+        ke semua: players + spectators.
+        """
+        b0 = board_ascii(self.players[0].board)
+        b1 = board_ascii(self.players[1].board)
+        # kepada pemain 1 & 2:
+        self.players[0].send(proto.TYPE_GAME, f"PLAYER-1\n{b0}")
+        self.players[0].send(proto.TYPE_GAME, f"PLAYER-2\n{b1}")
+        self.players[1].send(proto.TYPE_GAME, f"PLAYER-1\n{b0}")
+        self.players[1].send(proto.TYPE_GAME, f"PLAYER-2\n{b1}")
+        # kepada semua spectator:
         for s in self.spectators:
-            s.send(proto.TYPE_GAME, f"PLAYER-1\n{board_ascii(self.players[0].board)}")
-            s.send(proto.TYPE_GAME, f"PLAYER-2\n{board_ascii(self.players[1].board)}")
+            s.send(proto.TYPE_GAME, f"PLAYER-1\n{b0}")
+            s.send(proto.TYPE_GAME, f"PLAYER-2\n{b1}")
+
 
     # ---------- NEW: drain_chat ----------
     def _drain_chat(self, peers: list[Player]):
@@ -141,27 +161,26 @@ class GameSession(threading.Thread):
             if ptype == proto.TYPE_CHAT:
                 self.bcast(proto.TYPE_CHAT, f"{p.name}: {text}")
 
-    # ---------- tangani disconnect / reconnect ----------
-    def _handle_dc(self, leaver: Player, opponent: Player):
+    def _handle_dc(self, leaver: Player, opponent: Player) -> bool:
         self.bcast(proto.TYPE_CTRL,
-                f"DC {leaver.name} — waiting {RECONN_WAIT}s…")
-
+                   f"DC {leaver.name} — waiting {RECONN_WAIT}s to reconnect…")
         waited = 0
         while waited < RECONN_WAIT and not leaver.alive:
             time.sleep(1)
             waited += 1
 
-        if leaver.alive:                      # sukses re-connect
+        if leaver.alive:
             self.bcast(proto.TYPE_CTRL,
-                    f"REJOIN {leaver.name} — game resumes.")
-            return False                      # JANGAN akhiri game
-        else:                                 # gagal
+                       f"REJOIN {leaver.name} — game resumes.")
+            # ⬇️ kirim ulang papan terkini ke semua termasuk reconnecting player
+            self.push_boards()
+            return False
+        else:
             opponent.send(proto.TYPE_CTRL, "WIN")
             self.bcast(proto.TYPE_CTRL,
-                    f"{opponent.name} wins (opponent disconnect).")
-            return True                       # game berakhir
-
-
+                       f"{opponent.name} wins (opponent disconnect).")
+            return True
+        
     # ---------- main loop ----------
     def run(self):
         p0, p1 = self.players
@@ -184,10 +203,11 @@ class GameSession(threading.Thread):
 
             tp = me.recv(timeout=TURN_TIMEOUT)
             if tp is None:
-                if self._handle_dc(me, enemy):   # True => game selesai
+                # hanya break jika _handle_dc mengembalikan True
+                if self._handle_dc(me, enemy):
                     break
                 else:
-                    continue                     # lanjut giliran yg sama
+                    continue
 
             ptype, cmd = tp
 
@@ -246,6 +266,7 @@ class Lobby:
         self.session: GameSession|None = None
         threading.Thread(target=self._listener, daemon=True).start()
 
+    # ───────── listener + attach for reconnect ─────────────────────────────────
     def _listener(self):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -254,35 +275,46 @@ class Lobby:
             print(f"[INFO] Listen {HOST}:{PORT}")
 
             while True:
-                sock, addr = s.accept()
-                # ① baca 1 baris lengkap (username di-akhiri \n)
+                conn, addr = s.accept()
+                # baca username utuh lewat makefile.readline()
+                rfile = conn.makefile("r", buffering=1, newline="\n")
                 try:
-                    rfile = sock.makefile("r", buffering=1, newline="\n")
-                    username = rfile.readline(64).rstrip("\n") or \
-                            f"guest-{addr[0]}:{addr[1]}"
+                    username = rfile.readline(64).rstrip("\n")
                 except Exception:
-                    sock.close()
+                    conn.close()
                     continue
+                if not username:
+                    username = f"guest-{addr[0]}:{addr[1]}"
 
-                self._attach(sock, addr, username)
+                # attach or reattach
+                self._attach(conn, addr, username)
 
-    def _attach(self, sock, addr, name):
+    def _attach(self, conn, addr, name):
+        # — jika nama sudah terdaftar…
         if name in self.by_name:
             old = self.by_name[name]
-            if old.in_game:            # pemain masih di match  → re-attach
-                old.reattach(sock)
+            # …dan masih di match → paksa re-attach
+            if old.in_game:
+                old.reattach(conn)
+                print(f"[INFO] Reattached player {name}")
+                # 1) beri tahu klien bahwa reconnect sukses
+                old.send(proto.TYPE_CTRL, "RECONNECTED")
+                # 2) push papan terkini ke semua (inkl. klien ini)
+                if self.session and self.session.is_alive():
+                    self.session.push_boards()
                 return
-            else:                      # match-nya sudah selesai → buang record lama
+            # …jika match-nya sudah selesai → buang record lama
+            else:
                 old.close()
                 del self.by_name[name]
 
-        # nama baru
-        p = Player(sock, addr, name)
+        # nama baru → register & lobby
+        p = Player(conn, addr, name)
         self.by_name[name] = p
         threading.Thread(target=self._lobby_ping, args=(p,), daemon=True).start()
-
         if self.session and self.session.is_alive():
-            self.session.add_spectator(p)     # <- helper supaya welcome & push board
+            # ongoing match → jadi spectator via helper
+            self.session.add_spectator(p)
         else:
             p.send(proto.TYPE_CTRL, "CONNECTED waiting")
             self.waiting.put(p)
