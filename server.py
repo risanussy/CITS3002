@@ -132,21 +132,25 @@ class GameSession(threading.Thread):
 
     def push_boards(self):
         """
-        Kirim ASCII board PLAYER-1 & PLAYER-2
-        ke semua: players + spectators.
+        Kirim papan sesuai role:
+         - Player-1  ← hanya BOARD P1
+         - Player-2  ← hanya BOARD P2
+         - Spectator ← BOARD P1 & BOARD P2
         """
-        b0 = board_ascii(self.players[0].board)
-        b1 = board_ascii(self.players[1].board)
-        # kepada pemain 1 & 2:
+        # Siapkan ASCII art
+        b0 = board_ascii(self.players[0].board)  # P1 board
+        b1 = board_ascii(self.players[1].board)  # P2 board
+
+        # Player-1: only P1
         self.players[0].send(proto.TYPE_GAME, f"PLAYER-1\n{b0}")
-        self.players[0].send(proto.TYPE_GAME, f"PLAYER-2\n{b1}")
-        self.players[1].send(proto.TYPE_GAME, f"PLAYER-1\n{b0}")
+
+        # Player-2: only P2
         self.players[1].send(proto.TYPE_GAME, f"PLAYER-2\n{b1}")
-        # kepada semua spectator:
+
+        # Spectators: both
         for s in self.spectators:
             s.send(proto.TYPE_GAME, f"PLAYER-1\n{b0}")
             s.send(proto.TYPE_GAME, f"PLAYER-2\n{b1}")
-
 
     # ---------- NEW: drain_chat ----------
     def _drain_chat(self, peers: list[Player]):
