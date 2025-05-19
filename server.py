@@ -4,11 +4,12 @@ Battleship Server – Tier-4
 •   Instant messaging (type CHAT)
 •   Reconnect ≤ 60 s, spectators, lobby FIFO (masih sama)
 """
-
+# server.py  (bagian import)
 import socket, threading, time
 from queue import Queue, Empty
 from battleship import BOARD_SIZE, Board, SHIPS, safe_parse_coordinate
-import protocol as proto                    # ← import frame helpers
+
+import protocol_enc as proto      # ← pastikan baris ini persis
 
 HOST, PORT = "0.0.0.0", 5000
 TURN_TIMEOUT = 30
@@ -27,24 +28,36 @@ class Player:
         self.in_game = False
         self.alive = True
         self.lock  = threading.Lock()
+        self.noncetx= proto.nonce_gen()
+        self.last_seq_rx = 0     
 
-    # send pkt wrapper
-    def send(self, type_, text: str):
-        payload = text.encode()
-        pkt = proto.Packet(type_, next(self.seqtx), payload)
+    def send(self, ptype, text):
+        pkt = proto.Packet(
+            ptype,
+            next(self.seqtx),
+            next(self.noncetx),
+            text.encode()
+        )
         with self.lock:
-            try:
-                proto.send_pkt(self.sock, pkt)
-            except Exception:
-                self.alive = False
+            try: proto.send_pkt(self.sock, pkt)
+            except: self.alive=False
 
-    # recv pkt (returns (type, payload) or None)
+    # wrapper RECV – return (type, text) atau None kalau timeout/DC
     def recv(self, timeout=None):
-        pkt = proto.recv_pkt(self.sock, timeout)
-        if pkt is None:
+        try:
+            pkt = proto.recv_pkt(self.sock, self.last_seq_rx, timeout)
+        except OSError:                 # ← socket sudah invalid
             self.alive = False
             return None
+
+        if pkt is None:                 # timeout / EOF / crc error
+            self.alive = False
+            return None
+
+        self.last_seq_rx = pkt.seq      # update anti-replay tracker
         return pkt.type, pkt.data.decode(errors="replace")
+
+
 
     # reconnect: ganti socket
     def reattach(self, new_sock):
