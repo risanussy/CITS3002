@@ -86,11 +86,25 @@ class GameSession(threading.Thread):
             s.role = "spectator";  s.in_game = True
             self._welcome_spec(s)
 
+        self._lock = threading.Lock()  
+
     # ---------- helper ----------
     def _welcome_spec(self, s: Player):
         s.send(proto.TYPE_CTRL, "SPECTATOR-START")
         s.send(proto.TYPE_GAME, f"PLAYER-1\n{board_ascii(self.players[0].board)}")
         s.send(proto.TYPE_GAME, f"PLAYER-2\n{board_ascii(self.players[1].board)}")
+        
+    def add_spectator(self, p: Player):
+        """
+        Dipanggil oleh Lobby ketika ada klien baru bergabung
+        sementara match masih berlangsung.
+        """
+        with self._lock:                   # hindari race-condition
+            self.spectators.append(p)
+            p.role = "spectator"
+            p.in_game = True
+            self._welcome_spec(p)          # kirim papan & pesan sambutan
+
 
     def bcast(self, ptype, msg: str):
         for pl in (*self.players, *self.spectators):
@@ -116,29 +130,23 @@ class GameSession(threading.Thread):
 
     # ---------- tangani disconnect / reconnect ----------
     def _handle_dc(self, leaver: Player, opponent: Player):
-        """
-        Dipanggil ketika 'leaver' terputus di tengah giliran.
-        • Broadcast info DC
-        • Tunggu sampai RECONN_WAIT detik — jika reattach() terjadi,
-          self.alive akan True kembali → game berlanjut.
-        • Jika gagal reconnect, lawan menang otomatis.
-        """
         self.bcast(proto.TYPE_CTRL,
-                   f"DC {leaver.name} — waiting {RECONN_WAIT}s for reconnect…")
+                f"DC {leaver.name} — waiting {RECONN_WAIT}s…")
 
         waited = 0
         while waited < RECONN_WAIT and not leaver.alive:
             time.sleep(1)
             waited += 1
 
-        if leaver.alive:                         # sukses re-connect
+        if leaver.alive:                      # sukses re-connect
             self.bcast(proto.TYPE_CTRL,
-                       f"REJOIN {leaver.name} — game resumes.")
-        else:                                    # gagal → forfeit
+                    f"REJOIN {leaver.name} — game resumes.")
+            return False                      # JANGAN akhiri game
+        else:                                 # gagal
             opponent.send(proto.TYPE_CTRL, "WIN")
             self.bcast(proto.TYPE_CTRL,
-                       f"{opponent.name} wins (opponent disconnect).")
-            # keluar dari main-loop dengan mem‐break pada caller
+                    f"{opponent.name} wins (opponent disconnect).")
+            return True                       # game berakhir
 
 
     # ---------- main loop ----------
@@ -163,8 +171,10 @@ class GameSession(threading.Thread):
 
             tp = me.recv(timeout=TURN_TIMEOUT)
             if tp is None:
-                self._handle_dc(me, enemy)
-                break
+                if self._handle_dc(me, enemy):   # True => game selesai
+                    break
+                else:
+                    continue                     # lanjut giliran yg sama
 
             ptype, cmd = tp
 
@@ -225,32 +235,43 @@ class Lobby:
 
     def _listener(self):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR,1)
-            s.bind((HOST,PORT)); s.listen()
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((HOST, PORT))
+            s.listen()
             print(f"[INFO] Listen {HOST}:{PORT}")
+
             while True:
                 sock, addr = s.accept()
-                # pakai proto: username dikirim plaintext line pertama (tanpa frame)
-                name = sock.recv(64).decode(errors="ignore").strip() or \
-                       f"guest-{addr[0]}:{addr[1]}"
-                self._attach(sock, addr, name)
+                # ① baca 1 baris lengkap (username di-akhiri \n)
+                try:
+                    rfile = sock.makefile("r", buffering=1, newline="\n")
+                    username = rfile.readline(64).rstrip("\n") or \
+                            f"guest-{addr[0]}:{addr[1]}"
+                except Exception:
+                    sock.close()
+                    continue
+
+                self._attach(sock, addr, username)
 
     def _attach(self, sock, addr, name):
-        if name in self.by_name and not self.by_name[name].alive and \
-                                  self.by_name[name].in_game:
-            # re-connect
-            self.by_name[name].reattach(sock)
-            return
+        if name in self.by_name:
+            old = self.by_name[name]
+            if old.in_game:            # pemain masih di match  → re-attach
+                old.reattach(sock)
+                return
+            else:                      # match-nya sudah selesai → buang record lama
+                old.close()
+                del self.by_name[name]
 
+        # nama baru
         p = Player(sock, addr, name)
-        self.by_name[name]=p
+        self.by_name[name] = p
         threading.Thread(target=self._lobby_ping, args=(p,), daemon=True).start()
-        # jika game aktif → spectator
+
         if self.session and self.session.is_alive():
-            self.session.spectators.append(p); p.role="spectator"; p.in_game=True
-            self.session._welcome_spec(p)
+            self.session.add_spectator(p)     # <- helper supaya welcome & push board
         else:
-            p.send(proto.TYPE_CTRL,"CONNECTED waiting")
+            p.send(proto.TYPE_CTRL, "CONNECTED waiting")
             self.waiting.put(p)
 
     def _lobby_ping(self,p):
