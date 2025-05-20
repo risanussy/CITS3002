@@ -1,322 +1,308 @@
 """
-Battleship Server – Tier-4
-•   Custom frame + CRC-32 (protocol.py)
-•   Instant messaging (type CHAT)
-•   Reconnect ≤ 60 s, spectators, lobby FIFO (masih sama)
+Battleship Server – Tier-4.3 Complete
+• AES-CTR + CRC-32 (protocol_enc)
+• Instant chat (TYPE_CHAT)
+• Reconnect ≤ 60s (in-lobby & in-match)
+• Spectators, lobby FIFO, multiple matches
 """
-# server.py  (bagian import)
-import socket, threading, time
+import socket
+import threading
+import time
 from queue import Queue, Empty
-from battleship import BOARD_SIZE, Board, SHIPS, safe_parse_coordinate
 
-import protocol_enc as proto      # ← pastikan baris ini persis
+from battleship import BOARD_SIZE, Board, SHIPS, safe_parse_coordinate
+import protocol_enc as proto
 
 HOST, PORT = "0.0.0.0", 5000
-TURN_TIMEOUT = 30
-RECONN_WAIT  = 60
-PING_LOBBY   = 10
+TURN_TIMEOUT = 30      # detik per giliran
+RECONN_WAIT  = 60      # detik tunggu reconnect
+PING_LOBBY   = 10      # detik lobby ping
 
-# ────────── Player container
+# ──────── Player Definition ────────
 class Player:
     def __init__(self, sock: socket.socket, addr, name: str):
-        self.sock  = sock
-        self.addr  = addr
-        self.name  = name
-        self.seqtx = proto.seq_gen()        # seq# counter
-        self.board = Board(BOARD_SIZE); self.board.place_ships_randomly(SHIPS)
-        self.role  = "waiting"              # waiting|player|spectator
-        self.in_game = False
-        self.alive = True
-        self.lock  = threading.Lock()
-        self.noncetx= proto.nonce_gen()
-        self.last_seq_rx = 0     
+        self.sock         = sock
+        self.addr         = addr
+        self.name         = name
+        self.seqtx        = proto.seq_gen()
+        self.noncetx      = proto.nonce_gen()
+        self.last_seq_rx  = 0
+        self.board        = Board(BOARD_SIZE)
+        self.board.place_ships_randomly(SHIPS)
+        self.role         = "waiting"    # waiting | player | spectator
+        self.in_game      = False
+        self.alive        = True
+        self.lock         = threading.Lock()
 
-    def send(self, ptype, text):
-        pkt = proto.Packet(
-            ptype,
-            next(self.seqtx),
-            next(self.noncetx),
-            text.encode()
-        )
+    def send(self, ptype: int, text: str):
+        pkt = proto.Packet(ptype,
+                           next(self.seqtx),
+                           next(self.noncetx),
+                           text.encode())
         with self.lock:
-            try: proto.send_pkt(self.sock, pkt)
-            except: self.alive=False
+            try:
+                proto.send_pkt(self.sock, pkt)
+            except Exception:
+                self.alive = False
 
-    # wrapper RECV – return (type, text) atau None kalau timeout/DC
     def recv(self, timeout=None):
         try:
             pkt = proto.recv_pkt(self.sock, self.last_seq_rx, timeout)
-        except OSError:                 # ← socket sudah invalid
+        except OSError:
             self.alive = False
             return None
-
-        if pkt is None:                 # timeout / EOF / crc error
+        if pkt is None:
+            # timeout / EOF / crc error
             self.alive = False
             return None
-
-        self.last_seq_rx = pkt.seq      # update anti-replay tracker
+        # valid packet
+        self.last_seq_rx = pkt.seq
         return pkt.type, pkt.data.decode(errors="replace")
 
-    def reattach(self, new_sock):
+    def reattach(self, new_sock: socket.socket):
         with self.lock:
-            try: self.sock.shutdown(socket.SHUT_RDWR); self.sock.close()
-            except: pass
-            self.sock = new_sock
-            self.seqtx = proto.seq_gen()
-            self.noncetx = proto.nonce_gen()
-            self.alive = True
+            try:
+                self.sock.shutdown(socket.SHUT_RDWR)
+                self.sock.close()
+            except:
+                pass
+            self.sock        = new_sock
+            self.seqtx       = proto.seq_gen()
+            self.noncetx     = proto.nonce_gen()
+            self.alive       = True
 
     def close(self):
         with self.lock:
             self.alive = False
-            try: self.sock.shutdown(socket.SHUT_RDWR)
-            except: pass
-            try: self.sock.close()
-            except: pass
+            try:
+                self.sock.shutdown(socket.SHUT_RDWR)
+            except:
+                pass
+            try:
+                self.sock.close()
+            except:
+                pass
 
-# ────────── helper board → text
-def board_ascii(board: Board):
+# ──────── ASCII Board Helper ────────
+def board_ascii(board: Board) -> str:
     lines = []
     header = "  " + " ".join(str(i+1).rjust(2) for i in range(board.size))
     lines.append(header)
     for r in range(board.size):
-        rowlbl = chr(ord('A')+r)
+        row_label = chr(ord('A')+r)
         row = " ".join(board.display_grid[r][c] for c in range(board.size))
-        lines.append(f"{rowlbl:2} {row}")
+        lines.append(f"{row_label:2} {row}")
     return "\n".join(lines)
 
-# ────────────────────────────────────────── GameSession ──
+# ──────── GameSession ────────
 class GameSession(threading.Thread):
     def __init__(self, p0: Player, p1: Player, spectators: list[Player]):
         super().__init__(daemon=True)
-        self.current = 0 
-        self.players     = [p0, p1]
-        self.spectators  = spectators
-        for p in self.players:
-            p.role = "player";     p.in_game = True
-        for s in self.spectators:
-            s.role = "spectator";  s.in_game = True
-            self._welcome_spec(s)
-
-        self._lock = threading.Lock()  
-
-    # ---------- helper ----------
-    def _welcome_spec(self, s: Player):
-        s.send(proto.TYPE_CTRL, "SPECTATOR-START")
-        s.send(proto.TYPE_GAME, f"PLAYER-1\n{board_ascii(self.players[0].board)}")
-        s.send(proto.TYPE_GAME, f"PLAYER-2\n{board_ascii(self.players[1].board)}")
-        
-    def add_spectator(self, p: Player):
-        """
-        Dipanggil oleh Lobby ketika ada klien baru bergabung
-        sementara match masih berlangsung.
-        """
-        with self._lock:                   # hindari race-condition
-            self.spectators.append(p)
-            p.role = "spectator"
+        self.players    = [p0, p1]
+        self.spectators = spectators
+        self.current    = 0
+        # mark roles
+        for i, p in enumerate(self.players):
+            p.role    = "player"
             p.in_game = True
-            self._welcome_spec(p)          # kirim papan & pesan sambutan
+        for s in self.spectators:
+            s.role    = "spectator"
+            s.in_game = True
+            self._welcome_spec(s)
+        self._lock = threading.Lock()
 
+    def _welcome_spec(self, p: Player):
+        p.send(proto.TYPE_CTRL, "SPECTATOR-START")
+        # send two boards
+        p.send(proto.TYPE_GAME, f"PLAYER-1\n{board_ascii(self.players[0].board)}")
+        p.send(proto.TYPE_GAME, f"PLAYER-2\n{board_ascii(self.players[1].board)}")
 
-    def bcast(self, ptype, msg: str):
-        for pl in (*self.players, *self.spectators):
-            pl.send(ptype, msg)
+    def add_spectator(self, p: Player):
+        with self._lock:
+            self.spectators.append(p)
+            p.role    = "spectator"
+            p.in_game = True
+            self._welcome_spec(p)
+
+    def bcast(self, ptype: int, msg: str):
+        for p in (*self.players, *self.spectators):
+            p.send(ptype, msg)
 
     def push_boards(self):
         b0 = board_ascii(self.players[0].board)
         b1 = board_ascii(self.players[1].board)
-        # Player-1 only
+        # only their own
         self.players[0].send(proto.TYPE_GAME, f"PLAYER-1\n{b0}")
-        # Player-2 only
         self.players[1].send(proto.TYPE_GAME, f"PLAYER-2\n{b1}")
-        # Spectators both
+        # spectators see both
         for s in self.spectators:
             s.send(proto.TYPE_GAME, f"PLAYER-1\n{b0}")
             s.send(proto.TYPE_GAME, f"PLAYER-2\n{b1}")
 
-    # ---------- NEW: drain_chat ----------
-    def _drain_chat(self, peers: list[Player]):
-        """Ambil paket CHAT dari peers (lawan + spectator) tanpa blocking."""
-        for p in peers:
-            if not p.alive:
-                continue
-            tp = p.recv(timeout=0.01)          # 10 ms non-blocking
-            if tp is None:
-                continue
-            ptype, text = tp
-            if ptype == proto.TYPE_CHAT:
-                self.bcast(proto.TYPE_CHAT, f"{p.name}: {text}")
+    def _drain_chat(self):
+        # pull chat from everyone except current actor
+        others = [self.players[1-self.current], *self.spectators]
+        for p in others:
+            if not p.alive: continue
+            tp = p.recv(timeout=0.01)
+            if tp and tp[0] == proto.TYPE_CHAT:
+                self.bcast(proto.TYPE_CHAT, f"{p.name}: {tp[1]}")
 
-    def _handle_dc(self, leaver, opponent) -> bool:
+    def _handle_dc(self, leaver: Player, opponent: Player) -> bool:
         self.bcast(proto.TYPE_CTRL,
                    f"DC {leaver.name} — waiting {RECONN_WAIT}s to reconnect…")
-        waited = 0
-        while waited < RECONN_WAIT and not leaver.alive:
-            time.sleep(1); waited += 1
-
+        wait=0
+        while wait<RECONN_WAIT and not leaver.alive:
+            time.sleep(1); wait+=1
         if leaver.alive:
+            # reconnect success
             leaver.send(proto.TYPE_CTRL, "RECONNECTED")
             self.push_boards()
-            # Prompt giliran sesuai kondisi
-            if leaver is self.players[self.current]:
+            # prompt turn
+            if self.players[self.current] is leaver:
                 leaver.send(proto.TYPE_CTRL, f"YOURTURN {TURN_TIMEOUT}")
-                opponent.send(proto.TYPE_CTRL, "WAIT – opponent thinking…")
+                opponent.send(proto.TYPE_CTRL, "WAIT - opponent thinking…")
             else:
-                leaver.send(proto.TYPE_CTRL, "WAIT – opponent thinking…")
-                self.players[self.current].send(
-                    proto.TYPE_CTRL, f"YOURTURN {TURN_TIMEOUT}"
-                )
-            self.bcast(proto.TYPE_CTRL,
-                       f"REJOIN {leaver.name} — game resumes.")
+                opponent.send(proto.TYPE_CTRL, f"YOURTURN {TURN_TIMEOUT}")
+                leaver.send(proto.TYPE_CTRL,   "WAIT - opponent thinking…")
+            self.bcast(proto.TYPE_CTRL, f"REJOIN {leaver.name} — game resumes.")
             return False
-        else:
-            opponent.send(proto.TYPE_CTRL, "WIN")
-            self.bcast(proto.TYPE_CTRL,
-                       f"{opponent.name} wins (disconnect).")
-            return True
+        # reconnect timeout
+        opponent.send(proto.TYPE_CTRL, "WIN")
+        self.bcast(proto.TYPE_CTRL,
+                   f"{opponent.name} wins (opponent disconnect).")
+        return True
 
-    # ---------- main loop ----------
     def run(self):
         p0, p1 = self.players
         p0.send(proto.TYPE_CTRL, "MATCH-START FIRST")
         p1.send(proto.TYPE_CTRL, "MATCH-START SECOND")
-        self.current = 0  
-        p0, p1 = self.players
         self.bcast(proto.TYPE_CTRL, "MATCH-START")
-
-        current = 0
+        self.current = 0
         while True:
             me = self.players[self.current]
-            enemy = self.players[1-self.current]
+            en = self.players[1-self.current]
+            # drain chat first
+            self._drain_chat()
+            # send boards
             self.push_boards()
+            me.send(proto.TYPE_CTRL, f"YOURTURN {TURN_TIMEOUT}")
+            en.send(proto.TYPE_CTRL, "WAIT - opponent thinking…")
+            for s in self.spectators:
+                s.send(proto.TYPE_CTRL, "WAIT - opponent thinking…")
+            # receive
             tp = me.recv(timeout=TURN_TIMEOUT)
             if tp is None:
-                if self._handle_dc(me, enemy):
-                    break
-                else:
-                    continue
-
+                if self._handle_dc(me, en): break
+                else: continue
             ptype, cmd = tp
-
-            # pemain yg sedang giliran juga boleh chat
             if ptype == proto.TYPE_CHAT:
                 self.bcast(proto.TYPE_CHAT, f"{me.name}: {cmd}")
                 continue
             if ptype != proto.TYPE_GAME:
                 me.send(proto.TYPE_CTRL, "ERROR unexpected packet")
                 continue
-
-            if cmd.lower() == "quit":
+            # command
+            if cmd.lower()=="quit":
                 me.send(proto.TYPE_CTRL, "FORFEIT")
-                enemy.send(proto.TYPE_CTRL, "WIN")
-                self.bcast(proto.TYPE_CTRL,
-                           f"{enemy.name} wins (forfeit)")
+                en.send(proto.TYPE_CTRL, "WIN")
+                self.bcast(proto.TYPE_CTRL, f"{en.name} wins (forfeit)")
                 break
-
             try:
-                r, c = safe_parse_coordinate(cmd.strip())
+                r,c = safe_parse_coordinate(cmd)
             except ValueError as e:
                 me.send(proto.TYPE_CTRL, f"ERROR {e}")
                 continue
-
-            res, sunk = enemy.board.fire_at(r, c)
-            if res == "already_shot":
+            res,sunk = en.board.fire_at(r,c)
+            if res=="already_shot":
                 me.send(proto.TYPE_CTRL, "ERROR already_shot")
                 continue
-
-            tag   = "HIT" if res == "hit" else "MISS"
+            tag = "HIT" if res=="hit" else "MISS"
             extra = f" sunk {sunk}" if sunk else ""
             me.send(proto.TYPE_GAME, f"RESULT {tag}{extra}")
-            enemy.send(proto.TYPE_GAME, f"INCOMING {cmd} {tag}{extra}")
-            self.bcast(proto.TYPE_GAME,
-                       f"{me.name}→{cmd} {tag}{extra}")
-
-            if enemy.board.all_ships_sunk():
+            en.send(proto.TYPE_GAME, f"INCOMING {cmd} {tag}{extra}")
+            self.bcast(proto.TYPE_GAME, f"{me.name}→{cmd} {tag}{extra}")
+            if en.board.all_ships_sunk():
                 me.send(proto.TYPE_CTRL, "WIN")
-                enemy.send(proto.TYPE_CTRL, "LOSE")
-                self.bcast(proto.TYPE_CTRL,
-                           f"{me.name} wins (all ships sunk)")
+                en.send(proto.TYPE_CTRL, "LOSE")
+                self.bcast(proto.TYPE_CTRL, f"{me.name} wins (all ships sunk)")
                 break
-
-            current = 1 - current   # ganti giliran
-
-        # bersihkan status sesudah game
+            self.current = 1-self.current
+        # cleanup
         for p in (*self.players, *self.spectators):
-            p.role = "waiting"; p.in_game = False
+            p.role = "waiting"; p.in_game=False
 
-
-# ────────── Lobby Manager (minor mod – frame aware & chat pass-thru)
+# ──────── Lobby Manager ────────
 class Lobby:
     def __init__(self):
-        self.waiting: Queue[Player] = Queue()
-        self.by_name: dict[str, Player] = {}
-        self.session: GameSession|None = None
+        self.waiting = Queue()
+        self.by_name = {}
+        self.session = None
         threading.Thread(target=self._listener, daemon=True).start()
 
     def _listener(self):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind((HOST, PORT)); s.listen()
+            print(f"[INFO] Listening on {HOST}:{PORT}")
             while True:
                 conn, addr = s.accept()
                 rfile = conn.makefile("r", buffering=1, newline="\n")
                 name = rfile.readline(64).rstrip("\n") or f"guest-{addr[0]}:{addr[1]}"
                 self._attach(conn, addr, name)
-                
+
     def _attach(self, conn, addr, name):
-        # ① cek reconnect
+        # 1) reconnect existing
         if name in self.by_name:
             old = self.by_name[name]
-            # 1a) reconnect in‐match
             if old.in_game:
                 old.reattach(conn)
-                print(f"[INFO] Reattached in‐match: {name}")
+                print(f"[INFO] Reattach in-match: {name}")
                 old.send(proto.TYPE_CTRL, "RECONNECTED")
-                # kirim papan & status
                 if self.session and self.session.is_alive():
                     self.session.push_boards()
-                    old.send(proto.TYPE_CTRL,
-                             f"REJOIN {name} — game resumes.")
+                    old.send(proto.TYPE_CTRL, f"REJOIN {name} — game resumes.")
                 return
-            # 1b) reconnect di lobby
             else:
                 old.reattach(conn)
-                print(f"[INFO] Reattached in lobby: {name}")
+                print(f"[INFO] Reattach in-lobby: {name}")
                 old.send(proto.TYPE_CTRL, "RECONNECTED")
                 old.send(proto.TYPE_CTRL, "CONNECTED waiting")
                 self.waiting.put(old)
                 return
-
-        # ② nama baru → register
+        # 2) new registration
         p = Player(conn, addr, name)
         self.by_name[name] = p
         threading.Thread(target=self._lobby_ping, args=(p,), daemon=True).start()
-
-        # ③ jika match berjalan → spectator
         if self.session and self.session.is_alive():
             self.session.add_spectator(p)
         else:
             p.send(proto.TYPE_CTRL, "CONNECTED waiting")
             self.waiting.put(p)
 
-    def _lobby_ping(self,p):
+    def _lobby_ping(self, p: Player):
         while p.alive and not p.in_game:
-            p.send(proto.TYPE_CTRL,"LOBBY")
+            p.send(proto.TYPE_CTRL, "LOBBY")
             time.sleep(PING_LOBBY)
 
     def run(self):
         while True:
             if not (self.session and self.session.is_alive()):
-                # build next match
-                players=[]
-                while len(players)<2:
-                    try: cand=self.waiting.get(timeout=0.5)
-                    except Empty: cand=None
-                    if cand and cand.alive and not cand.in_game: players.append(cand)
-                specs=[pl for pl in self.by_name.values()
-                       if pl.alive and not pl.in_game and pl not in players]
+                # pair two players
+                players = []
+                while len(players) < 2:
+                    try:
+                        cand = self.waiting.get(timeout=0.5)
+                    except Empty:
+                        cand = None
+                    if cand and cand.alive and not cand.in_game:
+                        players.append(cand)
+                # collect spectators
+                specs = [pl for pl in self.by_name.values()
+                         if pl.alive and not pl.in_game and pl not in players]
                 self.session = GameSession(players[0], players[1], specs)
                 self.session.start()
             time.sleep(1)
 
-if __name__=="__main__":
+if __name__ == "__main__":
     Lobby().run()
