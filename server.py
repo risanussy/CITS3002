@@ -1,5 +1,5 @@
 """
-Battleship Server – Tier-4.3 Complete
+Battleship Server – Tier-4.3 Complete (Fixed Reconnect)
 • AES-CTR + CRC-32 (protocol_enc)
 • Instant chat (TYPE_CHAT)
 • Reconnect ≤ 60s (in-lobby & in-match)
@@ -14,25 +14,25 @@ from battleship import BOARD_SIZE, Board, SHIPS, safe_parse_coordinate
 import protocol_enc as proto
 
 HOST, PORT = "0.0.0.0", 5000
-TURN_TIMEOUT = 30      # detik per giliran
-RECONN_WAIT  = 60      # detik tunggu reconnect
-PING_LOBBY   = 10      # detik lobby ping
+TURN_TIMEOUT = 30      # seconds per turn
+RECONN_WAIT  = 60      # seconds wait for reconnect
+PING_LOBBY   = 10      # seconds lobby ping
 
-# ──────── Player Definition ────────
+# ───── Player Definition ──────────
 class Player:
-    def __init__(self, sock: socket.socket, addr, name: str):
-        self.sock         = sock
-        self.addr         = addr
-        self.name         = name
-        self.seqtx        = proto.seq_gen()
-        self.noncetx      = proto.nonce_gen()
-        self.last_seq_rx  = 0
-        self.board        = Board(BOARD_SIZE)
+    def __init__(self, sock, addr, name: str):
+        self.sock        = sock
+        self.addr        = addr
+        self.name        = name
+        self.seqtx       = proto.seq_gen()
+        self.noncetx     = proto.nonce_gen()
+        self.last_seq_rx = 0
+        self.board       = Board(BOARD_SIZE)
         self.board.place_ships_randomly(SHIPS)
-        self.role         = "waiting"    # waiting | player | spectator
-        self.in_game      = False
-        self.alive        = True
-        self.lock         = threading.Lock()
+        self.role        = "waiting"
+        self.in_game     = False
+        self.alive       = True
+        self.lock        = threading.Lock()
 
     def send(self, ptype: int, text: str):
         pkt = proto.Packet(ptype,
@@ -42,7 +42,7 @@ class Player:
         with self.lock:
             try:
                 proto.send_pkt(self.sock, pkt)
-            except Exception:
+            except:
                 self.alive = False
 
     def recv(self, timeout=None):
@@ -52,14 +52,12 @@ class Player:
             self.alive = False
             return None
         if pkt is None:
-            # timeout / EOF / crc error
             self.alive = False
             return None
-        # valid packet
         self.last_seq_rx = pkt.seq
         return pkt.type, pkt.data.decode(errors="replace")
 
-    def reattach(self, new_sock: socket.socket):
+    def reattach(self, new_sock):
         with self.lock:
             try:
                 self.sock.shutdown(socket.SHUT_RDWR)
@@ -69,32 +67,29 @@ class Player:
             self.sock        = new_sock
             self.seqtx       = proto.seq_gen()
             self.noncetx     = proto.nonce_gen()
+            self.last_seq_rx = 0
             self.alive       = True
 
     def close(self):
         with self.lock:
             self.alive = False
-            try:
-                self.sock.shutdown(socket.SHUT_RDWR)
-            except:
-                pass
-            try:
-                self.sock.close()
-            except:
-                pass
+            try: self.sock.shutdown(socket.SHUT_RDWR)
+            except: pass
+            try: self.sock.close()
+            except: pass
 
-# ──────── ASCII Board Helper ────────
+# ───── ASCII Board to Text ──────── to Text ────────
 def board_ascii(board: Board) -> str:
     lines = []
     header = "  " + " ".join(str(i+1).rjust(2) for i in range(board.size))
     lines.append(header)
     for r in range(board.size):
-        row_label = chr(ord('A')+r)
+        lbl = chr(ord('A') + r)
         row = " ".join(board.display_grid[r][c] for c in range(board.size))
-        lines.append(f"{row_label:2} {row}")
+        lines.append(f"{lbl:2} {row}")
     return "\n".join(lines)
 
-# ──────── GameSession ────────
+# ───── Game Session ──────────────
 class GameSession(threading.Thread):
     def __init__(self, p0: Player, p1: Player, spectators: list[Player]):
         super().__init__(daemon=True)
@@ -102,7 +97,7 @@ class GameSession(threading.Thread):
         self.spectators = spectators
         self.current    = 0
         # mark roles
-        for i, p in enumerate(self.players):
+        for p in self.players:
             p.role    = "player"
             p.in_game = True
         for s in self.spectators:
@@ -113,7 +108,6 @@ class GameSession(threading.Thread):
 
     def _welcome_spec(self, p: Player):
         p.send(proto.TYPE_CTRL, "SPECTATOR-START")
-        # send two boards
         p.send(proto.TYPE_GAME, f"PLAYER-1\n{board_ascii(self.players[0].board)}")
         p.send(proto.TYPE_GAME, f"PLAYER-2\n{board_ascii(self.players[1].board)}")
 
@@ -131,18 +125,19 @@ class GameSession(threading.Thread):
     def push_boards(self):
         b0 = board_ascii(self.players[0].board)
         b1 = board_ascii(self.players[1].board)
-        # only their own
+        # Player-1
         self.players[0].send(proto.TYPE_GAME, f"PLAYER-1\n{b0}")
+        # Player-2
         self.players[1].send(proto.TYPE_GAME, f"PLAYER-2\n{b1}")
-        # spectators see both
+        # Spectators
         for s in self.spectators:
             s.send(proto.TYPE_GAME, f"PLAYER-1\n{b0}")
             s.send(proto.TYPE_GAME, f"PLAYER-2\n{b1}")
 
     def _drain_chat(self):
-        # pull chat from everyone except current actor
-        others = [self.players[1-self.current], *self.spectators]
-        for p in others:
+        # gather chat from opponent & spectators
+        peers = [self.players[1-self.current], *self.spectators]
+        for p in peers:
             if not p.alive: continue
             tp = p.recv(timeout=0.01)
             if tp and tp[0] == proto.TYPE_CHAT:
@@ -151,11 +146,10 @@ class GameSession(threading.Thread):
     def _handle_dc(self, leaver: Player, opponent: Player) -> bool:
         self.bcast(proto.TYPE_CTRL,
                    f"DC {leaver.name} — waiting {RECONN_WAIT}s to reconnect…")
-        wait=0
-        while wait<RECONN_WAIT and not leaver.alive:
-            time.sleep(1); wait+=1
+        waited = 0
+        while waited < RECONN_WAIT and not leaver.alive:
+            time.sleep(1); waited += 1
         if leaver.alive:
-            # reconnect success
             leaver.send(proto.TYPE_CTRL, "RECONNECTED")
             self.push_boards()
             # prompt turn
@@ -167,10 +161,10 @@ class GameSession(threading.Thread):
                 leaver.send(proto.TYPE_CTRL,   "WAIT - opponent thinking…")
             self.bcast(proto.TYPE_CTRL, f"REJOIN {leaver.name} — game resumes.")
             return False
-        # reconnect timeout
+        # timeout
         opponent.send(proto.TYPE_CTRL, "WIN")
         self.bcast(proto.TYPE_CTRL,
-                   f"{opponent.name} wins (opponent disconnect).")
+                   f"{opponent.name} wins (disconnect).")
         return True
 
     def run(self):
@@ -182,15 +176,12 @@ class GameSession(threading.Thread):
         while True:
             me = self.players[self.current]
             en = self.players[1-self.current]
-            # drain chat first
             self._drain_chat()
-            # send boards
             self.push_boards()
             me.send(proto.TYPE_CTRL, f"YOURTURN {TURN_TIMEOUT}")
             en.send(proto.TYPE_CTRL, "WAIT - opponent thinking…")
             for s in self.spectators:
                 s.send(proto.TYPE_CTRL, "WAIT - opponent thinking…")
-            # receive
             tp = me.recv(timeout=TURN_TIMEOUT)
             if tp is None:
                 if self._handle_dc(me, en): break
@@ -202,8 +193,7 @@ class GameSession(threading.Thread):
             if ptype != proto.TYPE_GAME:
                 me.send(proto.TYPE_CTRL, "ERROR unexpected packet")
                 continue
-            # command
-            if cmd.lower()=="quit":
+            if cmd.lower() == "quit":
                 me.send(proto.TYPE_CTRL, "FORFEIT")
                 en.send(proto.TYPE_CTRL, "WIN")
                 self.bcast(proto.TYPE_CTRL, f"{en.name} wins (forfeit)")
@@ -213,11 +203,11 @@ class GameSession(threading.Thread):
             except ValueError as e:
                 me.send(proto.TYPE_CTRL, f"ERROR {e}")
                 continue
-            res,sunk = en.board.fire_at(r,c)
-            if res=="already_shot":
+            res, sunk = en.board.fire_at(r,c)
+            if res == "already_shot":
                 me.send(proto.TYPE_CTRL, "ERROR already_shot")
                 continue
-            tag = "HIT" if res=="hit" else "MISS"
+            tag = "HIT" if res == "hit" else "MISS"
             extra = f" sunk {sunk}" if sunk else ""
             me.send(proto.TYPE_GAME, f"RESULT {tag}{extra}")
             en.send(proto.TYPE_GAME, f"INCOMING {cmd} {tag}{extra}")
@@ -227,12 +217,13 @@ class GameSession(threading.Thread):
                 en.send(proto.TYPE_CTRL, "LOSE")
                 self.bcast(proto.TYPE_CTRL, f"{me.name} wins (all ships sunk)")
                 break
-            self.current = 1-self.current
-        # cleanup
+            self.current = 1 - self.current
+        # cleanup after match
         for p in (*self.players, *self.spectators):
-            p.role = "waiting"; p.in_game=False
+            p.role    = "waiting"
+            p.in_game = False
 
-# ──────── Lobby Manager ────────
+# ───── Lobby Manager ─────────────
 class Lobby:
     def __init__(self):
         self.waiting = Queue()
@@ -243,7 +234,8 @@ class Lobby:
     def _listener(self):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind((HOST, PORT)); s.listen()
+            s.bind((HOST, PORT))
+            s.listen()
             print(f"[INFO] Listening on {HOST}:{PORT}")
             while True:
                 conn, addr = s.accept()
@@ -252,9 +244,10 @@ class Lobby:
                 self._attach(conn, addr, name)
 
     def _attach(self, conn, addr, name):
-        # 1) reconnect existing
+        # existing user?
         if name in self.by_name:
             old = self.by_name[name]
+            # in-match reconnect
             if old.in_game:
                 old.reattach(conn)
                 print(f"[INFO] Reattach in-match: {name}")
@@ -263,14 +256,14 @@ class Lobby:
                     self.session.push_boards()
                     old.send(proto.TYPE_CTRL, f"REJOIN {name} — game resumes.")
                 return
-            else:
-                old.reattach(conn)
-                print(f"[INFO] Reattach in-lobby: {name}")
-                old.send(proto.TYPE_CTRL, "RECONNECTED")
-                old.send(proto.TYPE_CTRL, "CONNECTED waiting")
-                self.waiting.put(old)
-                return
-        # 2) new registration
+            # lobby reconnect
+            old.reattach(conn)
+            print(f"[INFO] Reattach in-lobby: {name}")
+            old.send(proto.TYPE_CTRL, "RECONNECTED")
+            old.send(proto.TYPE_CTRL, "CONNECTED waiting")
+            self.waiting.put(old)
+            return
+        # new registration
         p = Player(conn, addr, name)
         self.by_name[name] = p
         threading.Thread(target=self._lobby_ping, args=(p,), daemon=True).start()
@@ -287,8 +280,8 @@ class Lobby:
 
     def run(self):
         while True:
+            # start new match if none
             if not (self.session and self.session.is_alive()):
-                # pair two players
                 players = []
                 while len(players) < 2:
                     try:
@@ -297,7 +290,6 @@ class Lobby:
                         cand = None
                     if cand and cand.alive and not cand.in_game:
                         players.append(cand)
-                # collect spectators
                 specs = [pl for pl in self.by_name.values()
                          if pl.alive and not pl.in_game and pl not in players]
                 self.session = GameSession(players[0], players[1], specs)
