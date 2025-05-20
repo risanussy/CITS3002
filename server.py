@@ -57,23 +57,14 @@ class Player:
         self.last_seq_rx = pkt.seq      # update anti-replay tracker
         return pkt.type, pkt.data.decode(errors="replace")
 
-
-
-    # reconnect: ganti socket    
     def reattach(self, new_sock):
         with self.lock:
-            try:
-                self.sock.shutdown(socket.SHUT_RDWR)
-                self.sock.close()
-            except:
-                pass
+            try: self.sock.shutdown(socket.SHUT_RDWR); self.sock.close()
+            except: pass
             self.sock = new_sock
-            # reset seq & nonce streams OR biarkan melanjut?
-            # seq reset agar tidak ada overlap
             self.seqtx = proto.seq_gen()
             self.noncetx = proto.nonce_gen()
             self.alive = True
-            self.send(proto.TYPE_CTRL, "RECONNECTED")
 
     def close(self):
         with self.lock:
@@ -98,6 +89,7 @@ def board_ascii(board: Board):
 class GameSession(threading.Thread):
     def __init__(self, p0: Player, p1: Player, spectators: list[Player]):
         super().__init__(daemon=True)
+        self.current = 0 
         self.players     = [p0, p1]
         self.spectators  = spectators
         for p in self.players:
@@ -131,23 +123,13 @@ class GameSession(threading.Thread):
             pl.send(ptype, msg)
 
     def push_boards(self):
-        """
-        Kirim papan sesuai role:
-         - Player-1  ← hanya BOARD P1
-         - Player-2  ← hanya BOARD P2
-         - Spectator ← BOARD P1 & BOARD P2
-        """
-        # Siapkan ASCII art
-        b0 = board_ascii(self.players[0].board)  # P1 board
-        b1 = board_ascii(self.players[1].board)  # P2 board
-
-        # Player-1: only P1
+        b0 = board_ascii(self.players[0].board)
+        b1 = board_ascii(self.players[1].board)
+        # Player-1 only
         self.players[0].send(proto.TYPE_GAME, f"PLAYER-1\n{b0}")
-
-        # Player-2: only P2
+        # Player-2 only
         self.players[1].send(proto.TYPE_GAME, f"PLAYER-2\n{b1}")
-
-        # Spectators: both
+        # Spectators both
         for s in self.spectators:
             s.send(proto.TYPE_GAME, f"PLAYER-1\n{b0}")
             s.send(proto.TYPE_GAME, f"PLAYER-2\n{b1}")
@@ -165,49 +147,50 @@ class GameSession(threading.Thread):
             if ptype == proto.TYPE_CHAT:
                 self.bcast(proto.TYPE_CHAT, f"{p.name}: {text}")
 
-    def _handle_dc(self, leaver: Player, opponent: Player) -> bool:
+    def _handle_dc(self, leaver, opponent) -> bool:
         self.bcast(proto.TYPE_CTRL,
                    f"DC {leaver.name} — waiting {RECONN_WAIT}s to reconnect…")
         waited = 0
         while waited < RECONN_WAIT and not leaver.alive:
-            time.sleep(1)
-            waited += 1
+            time.sleep(1); waited += 1
 
         if leaver.alive:
+            leaver.send(proto.TYPE_CTRL, "RECONNECTED")
+            self.push_boards()
+            # Prompt giliran sesuai kondisi
+            if leaver is self.players[self.current]:
+                leaver.send(proto.TYPE_CTRL, f"YOURTURN {TURN_TIMEOUT}")
+                opponent.send(proto.TYPE_CTRL, "WAIT – opponent thinking…")
+            else:
+                leaver.send(proto.TYPE_CTRL, "WAIT – opponent thinking…")
+                self.players[self.current].send(
+                    proto.TYPE_CTRL, f"YOURTURN {TURN_TIMEOUT}"
+                )
             self.bcast(proto.TYPE_CTRL,
                        f"REJOIN {leaver.name} — game resumes.")
-            # ⬇️ kirim ulang papan terkini ke semua termasuk reconnecting player
-            self.push_boards()
             return False
         else:
             opponent.send(proto.TYPE_CTRL, "WIN")
             self.bcast(proto.TYPE_CTRL,
-                       f"{opponent.name} wins (opponent disconnect).")
+                       f"{opponent.name} wins (disconnect).")
             return True
-        
+
     # ---------- main loop ----------
     def run(self):
         p0, p1 = self.players
         p0.send(proto.TYPE_CTRL, "MATCH-START FIRST")
         p1.send(proto.TYPE_CTRL, "MATCH-START SECOND")
+        self.current = 0  
+        p0, p1 = self.players
         self.bcast(proto.TYPE_CTRL, "MATCH-START")
 
         current = 0
         while True:
-            me, enemy = self.players[current], self.players[1 - current]
+            me = self.players[self.current]
+            enemy = self.players[1-self.current]
             self.push_boards()
-
-            # ── ambil chat dari lawan + semua spectator
-            self._drain_chat([enemy, *self.spectators])
-
-            me.send(proto.TYPE_CTRL, f"YOURTURN {TURN_TIMEOUT}")
-            enemy.send(proto.TYPE_CTRL, "WAIT")
-            for s in self.spectators:
-                s.send(proto.TYPE_CTRL, "WAIT")
-
             tp = me.recv(timeout=TURN_TIMEOUT)
             if tp is None:
-                # hanya break jika _handle_dc mengembalikan True
                 if self._handle_dc(me, enemy):
                     break
                 else:
@@ -270,54 +253,46 @@ class Lobby:
         self.session: GameSession|None = None
         threading.Thread(target=self._listener, daemon=True).start()
 
-    # ───────── listener + attach for reconnect ─────────────────────────────────
     def _listener(self):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind((HOST, PORT))
-            s.listen()
-            print(f"[INFO] Listen {HOST}:{PORT}")
-
+            s.bind((HOST, PORT)); s.listen()
             while True:
                 conn, addr = s.accept()
-                # baca username utuh lewat makefile.readline()
                 rfile = conn.makefile("r", buffering=1, newline="\n")
-                try:
-                    username = rfile.readline(64).rstrip("\n")
-                except Exception:
-                    conn.close()
-                    continue
-                if not username:
-                    username = f"guest-{addr[0]}:{addr[1]}"
-
-                # attach or reattach
-                self._attach(conn, addr, username)
-
+                name = rfile.readline(64).rstrip("\n") or f"guest-{addr[0]}:{addr[1]}"
+                self._attach(conn, addr, name)
+                
     def _attach(self, conn, addr, name):
-        # — jika nama sudah terdaftar…
+        # ① cek reconnect
         if name in self.by_name:
             old = self.by_name[name]
-            # …dan masih di match → paksa re-attach
+            # 1a) reconnect in‐match
             if old.in_game:
                 old.reattach(conn)
-                print(f"[INFO] Reattached player {name}")
-                # 1) beri tahu klien bahwa reconnect sukses
+                print(f"[INFO] Reattached in‐match: {name}")
                 old.send(proto.TYPE_CTRL, "RECONNECTED")
-                # 2) push papan terkini ke semua (inkl. klien ini)
+                # kirim papan & status
                 if self.session and self.session.is_alive():
                     self.session.push_boards()
+                    old.send(proto.TYPE_CTRL,
+                             f"REJOIN {name} — game resumes.")
                 return
-            # …jika match-nya sudah selesai → buang record lama
+            # 1b) reconnect di lobby
             else:
-                old.close()
-                del self.by_name[name]
+                old.reattach(conn)
+                print(f"[INFO] Reattached in lobby: {name}")
+                old.send(proto.TYPE_CTRL, "RECONNECTED")
+                old.send(proto.TYPE_CTRL, "CONNECTED waiting")
+                self.waiting.put(old)
+                return
 
-        # nama baru → register & lobby
+        # ② nama baru → register
         p = Player(conn, addr, name)
         self.by_name[name] = p
         threading.Thread(target=self._lobby_ping, args=(p,), daemon=True).start()
+
+        # ③ jika match berjalan → spectator
         if self.session and self.session.is_alive():
-            # ongoing match → jadi spectator via helper
             self.session.add_spectator(p)
         else:
             p.send(proto.TYPE_CTRL, "CONNECTED waiting")
